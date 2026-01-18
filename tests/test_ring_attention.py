@@ -63,11 +63,11 @@ def run_forward_test(rank: int, world_size: int, results_queue: mp.Queue):
 
     try:
         # Test parameters
-        B = 2           # batch size
+        B = 1           # batch size
         n_heads = 8     # query heads
         n_kv_heads = 2  # key/value heads (GQA)
-        S_global = 64   # total sequence length
-        head_dim = 32   # dimension per head
+        S_global = 2048 # total sequence length
+        head_dim = 64   # dimension per head
         n_rep = n_heads // n_kv_heads
         S_local = S_global // world_size
 

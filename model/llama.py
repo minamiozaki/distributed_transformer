@@ -2,7 +2,11 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from dataclasses import dataclass
+from typing import Optional
+
+from .ring_attention import ring_attention_forward
 
 @dataclass
 class ModelArgs:
@@ -93,37 +97,54 @@ class CausalSelfAttention(nn.Module):
         self.n_heads = args.n_heads
         self.n_kv_heads = args.n_kv_heads
         # Calculate how many times to repeat keys/values
-        self.n_rep = self.n_heads // self.n_kv_heads 
+        self.n_rep = self.n_heads // self.n_kv_heads
         self.head_dim = args.dim // args.n_heads
-        
+
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, args.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(args.dim, args.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-    def forward(self, x, freqs_cis):
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        use_ring_attention: bool = False,
+        process_group: Optional[dist.ProcessGroup] = None,
+    ) -> torch.Tensor:
         B, S, _ = x.shape
-        
+
         xq = self.wq(x).view(B, S, self.n_heads, self.head_dim)
         xk = self.wk(x).view(B, S, self.n_kv_heads, self.head_dim)
         xv = self.wv(x).view(B, S, self.n_kv_heads, self.head_dim)
-        
+
         # RoPE
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
-        
+
         # Transpose to [B, H, S, D]
         xq = xq.transpose(1, 2)
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
-        
-        # --- FIX: REPEAT KV HEADS ---
-        if self.n_rep > 1:
-            xk = repeat_kv(xk, self.n_rep)
-            xv = repeat_kv(xv, self.n_rep)
-        
-        # Now shapes match: [B, 4, S, D] vs [B, 4, S, D]
-        output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
-        
+
+        if use_ring_attention:
+            # Ring attention handles GQA internally via n_rep parameter
+            # K, V stay in original shape [B, n_kv_heads, S, head_dim]
+            # Must be contiguous for distributed communication
+            output = ring_attention_forward(
+                xq.contiguous(),
+                xk.contiguous(),
+                xv.contiguous(),
+                process_group=process_group,
+                n_rep=self.n_rep,
+                is_causal=True,
+            )
+        else:
+            # Standard attention - expand KV heads for GQA
+            if self.n_rep > 1:
+                xk = repeat_kv(xk, self.n_rep)
+                xv = repeat_kv(xv, self.n_rep)
+            output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
+
         output = output.transpose(1, 2).contiguous().view(B, S, -1)
         return self.wo(output)
 
@@ -133,7 +154,7 @@ class Transformer(nn.Module):
         super().__init__()
         self.args = args
         self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
-        
+
         self.layers = nn.ModuleList([
             nn.ModuleDict({
                 'attention': CausalSelfAttention(args),
@@ -142,32 +163,62 @@ class Transformer(nn.Module):
                 'ffn_norm': RMSNorm(args.dim),
             }) for _ in range(args.n_layers)
         ])
-        
+
         self.norm = RMSNorm(args.dim)
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
-        
+
         # Initialize RoPE cache
         self.freqs_cis = precompute_freqs_cis(
             args.dim // args.n_heads, args.max_seq_len * 2, args.rope_theta
         )
 
-    def forward(self, input_ids):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        use_ring_attention: bool = False,
+        process_group: Optional[dist.ProcessGroup] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass with optional ring attention for context parallelism.
+
+        Args:
+            input_ids: [B, S_local] token IDs (local chunk for this rank)
+            use_ring_attention: If True, use ring attention for distributed sequence
+            process_group: ProcessGroup for ring attention (default: WORLD)
+
+        Returns:
+            logits: [B, S_local, vocab_size]
+        """
         B, S = input_ids.shape
-        
+
         # Handle RoPE device movement
         if self.freqs_cis.device != input_ids.device:
             self.freqs_cis = self.freqs_cis.to(input_ids.device)
-            
+
         h = self.tok_embeddings(input_ids)
-        freqs_cis = self.freqs_cis[:S]
-        
+
+        # Get freqs_cis for the correct global positions
+        if use_ring_attention:
+            # Each rank holds a chunk of the sequence
+            # Need freqs_cis for global positions, not local
+            rank = dist.get_rank(process_group)
+            world_size = dist.get_world_size(process_group)
+            start_pos = rank * S
+            freqs_cis = self.freqs_cis[start_pos:start_pos + S]
+        else:
+            freqs_cis = self.freqs_cis[:S]
+
         for layer in self.layers:
             # 1. Attention Block
             h_norm = layer['attention_norm'](h)
-            h = h + layer['attention'](h_norm, freqs_cis)
-            
+            h = h + layer['attention'](
+                h_norm, freqs_cis,
+                use_ring_attention=use_ring_attention,
+                process_group=process_group,
+            )
+
             # 2. FFN Block (SwiGLU)
             h_norm = layer['ffn_norm'](h)
             h = h + layer['feed_forward'](h_norm)
-            
+
         return self.output(self.norm(h))

@@ -18,6 +18,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model.ring_attention import ring_attention_forward, repeat_kv
+from model.llama import Transformer, ModelArgs
 
 
 def reference_attention(
@@ -252,9 +253,161 @@ def test_non_causal():
     print("Non-causal test passed!")
 
 
+# ============================================================================
+# Full Model Tests with Ring Attention
+# ============================================================================
+
+def run_full_model_test(rank: int, world_size: int, results_queue: mp.Queue):
+    """
+    Test full LLaMA model with ring attention against single-GPU reference.
+
+    Each rank:
+    1. Creates the same model (same seed)
+    2. Gets its local chunk of input tokens
+    3. Runs forward pass with ring attention
+    4. Compares against reference single-GPU forward pass
+    """
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12357'
+
+    dist.init_process_group(
+        backend='gloo',
+        rank=rank,
+        world_size=world_size
+    )
+
+    try:
+        # Small model config for testing
+        args = ModelArgs(
+            dim=256,
+            n_layers=2,
+            n_heads=8,
+            n_kv_heads=2,  # GQA: 4x repetition
+            vocab_size=1000,
+            max_seq_len=512,
+            multiple_of=64,
+        )
+
+        # Test parameters
+        B = 1
+        S_global = 256  # Total sequence length
+        S_local = S_global // world_size
+
+        # Create model with same seed on all ranks
+        torch.manual_seed(42)
+        model = Transformer(args)
+        model.eval()
+
+        # Create input tokens (same on all ranks)
+        torch.manual_seed(123)
+        input_ids_full = torch.randint(0, args.vocab_size, (B, S_global))
+
+        # Reference: single-GPU forward pass with full sequence
+        with torch.no_grad():
+            logits_ref = model(input_ids_full, use_ring_attention=False)
+
+        # Split input for this rank
+        start = rank * S_local
+        end = start + S_local
+        input_ids_local = input_ids_full[:, start:end].contiguous()
+
+        # Distributed: ring attention forward pass with local chunk
+        with torch.no_grad():
+            logits_local = model(
+                input_ids_local,
+                use_ring_attention=True,
+                process_group=None,  # Use default WORLD group
+            )
+
+        # Gather outputs from all ranks
+        logits_gathered = [torch.empty_like(logits_local) for _ in range(world_size)]
+        dist.all_gather(logits_gathered, logits_local)
+        logits_ring = torch.cat(logits_gathered, dim=1)
+
+        # Compare
+        logits_ref_local = logits_ref[:, start:end, :]
+        local_diff = (logits_local - logits_ref_local).abs().max().item()
+
+        if rank == 0:
+            full_diff = (logits_ring - logits_ref).abs().max().item()
+            mean_diff = (logits_ring - logits_ref).abs().mean().item()
+
+            results_queue.put({
+                'status': 'success',
+                'full_max_diff': full_diff,
+                'full_mean_diff': mean_diff,
+                'local_max_diff': local_diff,
+            })
+
+            print(f"\n{'='*60}")
+            print(f"Full LLaMA Model with Ring Attention Test Results")
+            print(f"{'='*60}")
+            print(f"Model: dim={args.dim}, layers={args.n_layers}, "
+                  f"heads={args.n_heads}, kv_heads={args.n_kv_heads}")
+            print(f"World size: {world_size}")
+            print(f"Sequence: {S_global} global, {S_local} per rank")
+            print(f"{'='*60}")
+            print(f"Max difference: {full_diff:.2e}")
+            print(f"Mean difference: {mean_diff:.2e}")
+            print(f"{'='*60}")
+
+            if full_diff < 1e-4:
+                print("PASSED: Ring attention model matches reference!")
+            else:
+                print(f"FAILED: Difference {full_diff:.2e} exceeds threshold 1e-4")
+
+    except Exception as e:
+        if rank == 0:
+            results_queue.put({
+                'status': 'error',
+                'error': str(e)
+            })
+        raise
+
+    finally:
+        dist.destroy_process_group()
+
+
+def test_full_model_ring_attention():
+    """Test full LLaMA model with ring attention."""
+    world_size = 4
+
+    mp.set_start_method('spawn', force=True)
+
+    results_queue = mp.Queue()
+
+    processes = []
+    for rank in range(world_size):
+        p = mp.Process(
+            target=run_full_model_test,
+            args=(rank, world_size, results_queue)
+        )
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
+    if not results_queue.empty():
+        result = results_queue.get()
+        if result['status'] == 'error':
+            raise RuntimeError(f"Test failed: {result['error']}")
+        elif result['full_max_diff'] >= 1e-4:
+            raise AssertionError(
+                f"Model output differs from reference by {result['full_max_diff']:.2e}"
+            )
+
+    print("\nFull model test passed!")
+
+
 if __name__ == '__main__':
     print("Testing Ring Attention (Causal)...")
     test_ring_attention_forward()
 
     print("\nTesting Ring Attention (Non-Causal)...")
     test_non_causal()
+
+    print("\n" + "="*60)
+    print("Testing Full LLaMA Model with Ring Attention...")
+    print("="*60)
+    test_full_model_ring_attention()

@@ -50,6 +50,24 @@ distributed_transformer/
 pip install torch>=2.2.0 numpy<2.0 transformers datasets fire
 ```
 
+## Quick Start
+
+```bash
+# Clone and install
+git clone https://github.com/yourusername/distributed_transformer.git
+cd distributed_transformer
+pip install -r requirements.txt
+
+# Verify correctness
+python tests/test_ring_attention.py
+
+# Run benchmark (CPU/Mac)
+python tests/benchmark_ring_attention.py --mode compare
+
+# Run benchmark (Multi-GPU with NCCL)
+python tests/benchmark_ring_attention.py --mode compare --world-size 4
+```
+
 ## Usage
 
 ### Run Correctness Tests
@@ -124,6 +142,61 @@ Rank 3 (Q[768:1024]):
   Step 3: Attend to K[0:256]    ← past, no mask
 ```
 
+## RoPE Positioning in Distributed Mode
+
+Each rank must use **global** position indices for RoPE, not local:
+
+```
+Global sequence: [token_0, token_1, ..., token_1023]
+                      ↓
+Split across 4 GPUs:
+  Rank 0: tokens [0:256]   → freqs_cis[0:256]
+  Rank 1: tokens [256:512] → freqs_cis[256:512]
+  Rank 2: tokens [512:768] → freqs_cis[512:768]
+  Rank 3: tokens [768:1024]→ freqs_cis[768:1024]
+```
+
+If rank 1 incorrectly used `freqs_cis[0:256]`, its tokens would have wrong positional info, breaking attention.
+
+```python
+# In Transformer.forward():
+if use_ring_attention:
+    rank = dist.get_rank(process_group)
+    start_pos = rank * S  # Global position offset
+    freqs_cis = self.freqs_cis[start_pos:start_pos + S]
+else:
+    freqs_cis = self.freqs_cis[:S]
+```
+
+## Online Softmax Algorithm
+
+Ring attention uses online softmax to accumulate attention across K,V chunks without materializing the full attention matrix:
+
+```python
+# For each K,V chunk from the ring:
+scores = Q @ K.T / sqrt(d)
+block_max = scores.max()
+
+# Update running max
+new_max = max(running_max, block_max)
+
+# Rescale previous output
+scale = exp(running_max - new_max)
+output = output * scale
+
+# Add current block's contribution
+weights = exp(scores - new_max)
+output += weights @ V
+
+# Update normalizer
+normalizer = normalizer * scale + weights.sum()
+
+# Final output
+output = output / normalizer
+```
+
+This is numerically stable and memory efficient - we never store the full [S, S] attention matrix.
+
 ## Benchmark Metrics
 
 | Metric | Description |
@@ -137,15 +210,88 @@ Rank 3 (Q[768:1024]):
 
 Supported GPUs: A100, H100
 
+### MFU (Model FLOPs Utilization)
+
+MFU measures how efficiently you use the GPU's compute capability:
+
+```
+MFU = Achieved TFLOPS / Peak TFLOPS
+```
+
+We use **actual profiled FLOPs** from PyTorch profiler (`with_flops=True`), not estimates:
+
+```python
+with torch.profiler.profile(with_flops=True) as prof:
+    model(input_ids)
+
+total_flops = sum(e.flops for e in prof.key_averages() if e.flops > 0)
+achieved_tflops = total_flops / latency_sec / 1e12
+mfu = achieved_tflops / peak_tflops
+```
+
+| MFU Range | Interpretation |
+|-----------|----------------|
+| 50%+ | Excellent |
+| 30-50% | Good (typical for training) |
+| 15-30% | Decent |
+| <15% | Likely memory-bound |
+
+### TensorCore Utilization
+
+Percentage of GPU time spent in matmul operations (which use TensorCores):
+
+```
+TC% = matmul_cuda_time / total_cuda_time
+```
+
+Higher is better - means more time doing useful matrix math vs overhead.
+
+### Comm/Compute Ratio
+
+For ring attention, measures communication overhead:
+
+```
+Comm% = barrier_sync_time / compute_time
+```
+
+Lower is better. When `T_comm < T_compute`, communication is fully hidden.
+
+## Distributed Backends
+
+| Backend | Device | Use Case |
+|---------|--------|----------|
+| NCCL | CUDA GPUs | Production multi-GPU (fastest) |
+| Gloo | CPU | Testing, Mac development |
+
+```python
+# Automatic selection in benchmark
+backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+```
+
+NCCL uses NVLink/PCIe for direct GPU-to-GPU communication. Gloo routes through CPU memory.
+
 ## Performance Expectations
 
-| Sequence Length | Vanilla | Ring Attention |
-|-----------------|---------|----------------|
-| Short (< 4K) | Faster (no comm overhead) | Slight overhead |
-| Medium (4K-32K) | Limited by memory | Near-vanilla latency |
-| Long (32K+) | OOM | Only option that works |
+| Sequence Length | Vanilla Attention | Ring Attention | Winner |
+|-----------------|-------------------|----------------|--------|
+| Short (< 4K) | ~1-5ms | ~2-8ms | Vanilla (no comm overhead) |
+| Medium (4K-32K) | ~50-500ms | ~50-500ms | Tie (comm hidden) |
+| Long (32K+) | OOM | Works | Ring (only option) |
+| Very Long (128K+) | OOM | Works | Ring (enables new capabilities) |
 
-Ring attention achieves near-vanilla latency when communication is hidden behind compute (T_comm < T_compute).
+**Key insight**: Ring attention's value isn't speed—it's enabling sequence lengths that would otherwise be impossible due to memory constraints.
+
+## Limitations & Future Work
+
+**Current limitations:**
+- Forward pass only (no backward pass / training)
+- No FlashAttention integration (would further improve memory)
+- Causal mask doesn't skip future chunks (potential optimization)
+
+**Potential optimizations:**
+- Skip attention computation for fully-masked future chunks
+- Fuse K,V communication with attention computation
+- Integrate with FlashAttention-2 for block-sparse attention
 
 ## References
 

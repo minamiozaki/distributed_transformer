@@ -91,21 +91,23 @@ def profile_flops_and_metrics(model, input_ids, num_iters=5, use_ring_attention=
                 with_flops=True,
             ) as prof:
                 with torch.no_grad():
+                    print(f"Device {device} starting iterations")
                     for _ in range(num_iters):
                         _ = model(input_ids, use_ring_attention=use_ring_attention)
+                        print(f"Device {device} finished iteration {_}")
                         torch.cuda.synchronize()
-
+            print(f"Device {device} finished iterations, extracting stats")
             # Extract stats
             key_averages = prof.key_averages()
 
             # Total CUDA time
-            total_cuda_time_us = sum(e.cuda_time_total for e in key_averages)
+            total_cuda_time_us = sum(e.cuda_time for e in key_averages)
 
             # Find matmul/GEMM operations (TensorCore candidates)
             matmul_time_us = 0
             for e in key_averages:
                 if any(op in e.key.lower() for op in ['matmul', 'gemm', 'mm', 'bmm', 'linear', 'addmm']):
-                    matmul_time_us += e.cuda_time_total
+                    matmul_time_us += e.cuda_time
 
             # TensorCore utilization estimate (matmul time / total CUDA time)
             tensorcore_util = matmul_time_us / total_cuda_time_us if total_cuda_time_us > 0 else 0
@@ -292,206 +294,242 @@ def benchmark_vanilla_attention(
     return results
 
 
-def benchmark_ring_attention_worker(
-    rank: int,
-    world_size: int,
-    args: ModelArgs,
-    batch_size: int,
-    seq_len_global: int,
-    num_warmup: int,
-    num_iters: int,
-    results_queue: mp.Queue,
-    backend: str = 'gloo',
-    dtype: torch.dtype = torch.float32,
-):
-    """Worker function for ring attention benchmark."""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12358'
+def benchmark_ring_attention_worker(                                                                               
+      rank: int,                                                                                                     
+      world_size: int,                                                                                               
+      args: ModelArgs,                                                                                               
+      batch_size: int,                                                                                               
+      seq_len_global: int,                                                                                           
+      num_warmup: int,                                                                                               
+      num_iters: int,                                                                                                
+      results_queue: mp.Queue,                                                                                       
+      backend: str = 'gloo',                                                                                         
+      dtype: torch.dtype = torch.float32,                                                                            
+  ):                                                                                                                 
+      """Worker function for ring attention benchmark."""                                                            
+      os.environ['MASTER_ADDR'] = 'localhost'                                                                        
+      os.environ['MASTER_PORT'] = '12358'                                                                            
+                                                                                                                     
+      # Use NCCL for CUDA, Gloo for CPU                                                                              
+      if torch.cuda.is_available() and backend == 'nccl':                                                            
+          device = torch.device(f'cuda:{rank}')                                                                      
+          torch.cuda.set_device(device)                                                                              
+          dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)                                  
+      else:                                                                                                          
+          device = torch.device('cpu')                                                                               
+          dist.init_process_group(backend='gloo', rank=rank, world_size=world_size)                                  
+                                                                                                                     
+      try:                                                                                                           
+          seq_len_local = seq_len_global // world_size                                                               
+                                                                                                                     
+          if rank == 0:                                                                                              
+              print(f"\n{'='*60}")                                                                                   
+              print(f"Benchmarking Ring Attention")                                                                  
+              print(f"{'='*60}")                                                                                     
+              print(f"Device: {device}")                                                                             
+              if device.type == 'cuda':                                                                              
+                  print(f"GPU: {torch.cuda.get_device_name()}")                                                      
+              print(f"World size: {world_size}")                                                                     
+              print(f"Model: dim={args.dim}, layers={args.n_layers}, heads={args.n_heads}")                          
+              print(f"Batch size: {batch_size}")                                                                     
+              print(f"Sequence length: {seq_len_global} global, {seq_len_local} per rank")                           
+              print(f"{'='*60}")                                                                                     
+                                                                                                                     
+          # Create model (same seed on all ranks)                                                                    
+          torch.manual_seed(42)                                                                                      
+          model = Transformer(args).to(device)                                                                       
+          if dtype == torch.bfloat16 and device.type == 'cuda':                                                      
+              model = model.to(dtype=dtype)                                                                          
+          model.eval()                                                                                               
+                                                                                                                     
+          num_params = count_parameters(model)                                                                       
+          if rank == 0:                                                                                              
+              print(f"Model parameters: {num_params / 1e6:.2f}M")                                                    
+                                                                                                                     
+          # Create input (same on all ranks, then split)                                                             
+          torch.manual_seed(123)                                                                                     
+          input_ids_full = torch.randint(0, args.vocab_size, (batch_size, seq_len_global))                           
+          start_idx = rank * seq_len_local                                                                           
+          end_idx = start_idx + seq_len_local                                                                        
+          input_ids_local = input_ids_full[:, start_idx:end_idx].to(device).contiguous()                             
+                                                                                                                     
+          # Warmup                                                                                                   
+          if rank == 0:                                                                                              
+              print(f"Warming up ({num_warmup} iterations)...")                                                      
+                                                                                                                     
+          dist.barrier()                                                                                             
+          with torch.no_grad():                                                                                      
+              for _ in range(num_warmup):                                                                            
+                  _ = model(input_ids_local, use_ring_attention=True)                                                
+                  if device.type == 'cuda':                                                                          
+                      torch.cuda.synchronize()                                                                       
+          dist.barrier()                                                                                             
+                                                                                                                     
+          # Profile FLOPs - all ranks must participate in ring attention forward passes                              
+          # but only rank 0 captures the profiler stats                                                              
+          profile_stats = {'total_flops': 0, 'tensorcore_util': 0, 'profiler_available': False}                      
+          num_profile_iters = 3                                                                                      
+                                                                                                                     
+          if rank == 0:                                                                                              
+              print("Profiling for FLOPs...")                                                                                                                                                                  
+                                                                                                                     
+          if device.type == 'cuda':                                                                                  
+              try:                                                                                                   
+                  from torch.profiler import profile, ProfilerActivity                                               
+                                                                                                                     
+                  # Only rank 0 uses the profiler, but all ranks run forward passes                                  
+                  if rank == 0:                                                                                      
+                      with profile(                                                                                  
+                          activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],                                  
+                          record_shapes=True,                                                                        
+                          with_flops=True,                                                                           
+                      ) as prof:                                                                                     
+                          with torch.no_grad():                                                                      
+                              for _ in range(num_profile_iters):                                                     
+                                  _ = model(input_ids_local, use_ring_attention=True)                                
+                                  torch.cuda.synchronize()                                                           
+                                                                                                                     
+                      # Extract stats on rank 0                                                                      
+                      key_averages = prof.key_averages()                                                             
+                      total_cuda_time_us = sum(e.cuda_time for e in key_averages)                              
+                      matmul_time_us = 0                                                                             
+                      for e in key_averages:                                                                         
+                          if any(op in e.key.lower() for op in ['matmul', 'gemm', 'mm', 'bmm', 'linear', 'addmm']):  
+                              matmul_time_us += e.cuda_time                                                    
+                      tensorcore_util = matmul_time_us / total_cuda_time_us if total_cuda_time_us > 0 else 0         
+                      total_flops = sum(e.flops for e in key_averages if e.flops > 0)                                
+                      flops_per_iter = total_flops / num_profile_iters                                               
+                                                                                                                     
+                      profile_stats = {                                                                              
+                          'total_flops': flops_per_iter * world_size,  # Scale for all GPUs                          
+                          'tensorcore_util': tensorcore_util,                                                        
+                          'profiler_available': True,                                                                
+                      }
+                  else:
+                      print("Rank {rank} running forward passes without profiling")                                                                                       
+                      # Other ranks run the same forward passes without profiling                                    
+                      with torch.no_grad():                                                                          
+                          for _ in range(num_profile_iters):                                                         
+                              _ = model(input_ids_local, use_ring_attention=True)                                    
+                              torch.cuda.synchronize()                                                               
+              except Exception as e:                                                                                 
+                  if rank == 0:                                                                                      
+                      print(f"  Profiling failed: {e}")                                                              
+                                                                                                                     
+          dist.barrier()                                                                                             
+                                                                                                                     
+          # Reset memory stats after warmup/profiling                                                                
+          if device.type == 'cuda':                                                                                  
+              torch.cuda.reset_peak_memory_stats()                                                                   
+                                                                                                                     
+          # Benchmark with comm/compute breakdown                                                                    
+          if rank == 0:                                                                                              
+              print(f"Benchmarking ({num_iters} iterations)...")                                                     
+                                                                                                                     
+          latencies = []                                                                                             
+          compute_times = []                                                                                         
+          comm_times = []                                                                                            
+                                                                                                                     
+          dist.barrier()                                                                                             
+                                                                                                                     
+          with torch.no_grad():                                                                                      
+              for i in range(num_iters):                                                                             
+                  if device.type == 'cuda':                                                                          
+                      torch.cuda.synchronize()                                                                       
+                                                                                                                     
+                  # Measure barrier (communication sync) time                                                        
+                  comm_start = time.perf_counter()                                                                   
+                  dist.barrier()                                                                                     
+                  if device.type == 'cuda':                                                                          
+                      torch.cuda.synchronize()                                                                       
+                  comm_end = time.perf_counter()                                                                     
+                                                                                                                     
+                  # Measure total iteration time                                                                     
+                  start = time.perf_counter()                                                                        
+                  _ = model(input_ids_local, use_ring_attention=True)                                                
+                                                                                                                     
+                  if device.type == 'cuda':                                                                          
+                      torch.cuda.synchronize()                                                                       
+                  dist.barrier()                                                                                     
+                                                                                                                     
+                  end = time.perf_counter()                                                                          
+                                                                                                                     
+                  total_time = (end - start) * 1000  # ms                                                            
+                  barrier_time = (comm_end - comm_start) * 1000  # ms                                                
+                                                                                                                     
+                  latencies.append(total_time)                                                                       
+                  comm_times.append(barrier_time)                                                                    
+                  compute_times.append(total_time - barrier_time)                                                    
+                                                                                                                     
+          # Compute stats (only on rank 0)                                                                           
+          if rank == 0:                                                                                              
+              avg_latency = sum(latencies) / len(latencies)                                                          
+              min_latency = min(latencies)                                                                           
+              max_latency = max(latencies)                                                                           
+              throughput = (batch_size * seq_len_global) / (avg_latency / 1000)                                      
+                                                                                                                     
+              avg_compute = sum(compute_times) / len(compute_times)                                                  
+              avg_comm = sum(comm_times) / len(comm_times)                                                           
+                                                                                                                     
+              # Comm/Compute ratio                                                                                   
+              comm_compute_ratio = avg_comm / avg_compute if avg_compute > 0 else 0                                  
+                                                                                                                     
+              if device.type == 'cuda':                                                                              
+                  mem_allocated = torch.cuda.max_memory_allocated(device) / 1024**3                                  
+                  mem_reserved = torch.cuda.max_memory_reserved(device) / 1024**3                                    
+              else:                                                                                                  
+                  mem_allocated = 0                                                                                  
+                  mem_reserved = 0                                                                                   
+                                                                                                                     
+              # MFU using actual profiled FLOPs                                                                      
+              mfu_stats = compute_mfu(profile_stats['total_flops'], avg_latency / 1000, dtype)                       
 
-    # Use NCCL for CUDA, Gloo for CPU
-    if torch.cuda.is_available() and backend == 'nccl':
-        device = torch.device(f'cuda:{rank}')
-        torch.cuda.set_device(device)
-        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
-    else:
-        device = torch.device('cpu')
-        dist.init_process_group(backend='gloo', rank=rank, world_size=world_size)
-
-    try:
-        seq_len_local = seq_len_global // world_size
-
-        if rank == 0:
-            print(f"\n{'='*60}")
-            print(f"Benchmarking Ring Attention")
-            print(f"{'='*60}")
-            print(f"Device: {device}")
-            if device.type == 'cuda':
-                print(f"GPU: {torch.cuda.get_device_name()}")
-            print(f"World size: {world_size}")
-            print(f"Model: dim={args.dim}, layers={args.n_layers}, heads={args.n_heads}")
-            print(f"Batch size: {batch_size}")
-            print(f"Sequence length: {seq_len_global} global, {seq_len_local} per rank")
-            print(f"{'='*60}")
-
-        # Create model (same seed on all ranks)
-        torch.manual_seed(42)
-        model = Transformer(args).to(device)
-        if dtype == torch.bfloat16 and device.type == 'cuda':
-            model = model.to(dtype=dtype)
-        model.eval()
-
-        num_params = count_parameters(model)
-        if rank == 0:
-            print(f"Model parameters: {num_params / 1e6:.2f}M")
-
-        # Create input (same on all ranks, then split)
-        torch.manual_seed(123)
-        input_ids_full = torch.randint(0, args.vocab_size, (batch_size, seq_len_global))
-        start_idx = rank * seq_len_local
-        end_idx = start_idx + seq_len_local
-        input_ids_local = input_ids_full[:, start_idx:end_idx].to(device).contiguous()
-
-        # Warmup
-        if rank == 0:
-            print(f"Warming up ({num_warmup} iterations)...")
-
-        dist.barrier()
-        with torch.no_grad():
-            for _ in range(num_warmup):
-                _ = model(input_ids_local, use_ring_attention=True)
-                if device.type == 'cuda':
-                    torch.cuda.synchronize()
-        dist.barrier()
-
-        # Profile FLOPs on rank 0 only (to avoid distributed profiling complexity)
-        # Note: For ring attention, we profile the local computation
-        # Total system FLOPs = local FLOPs * world_size (approximately)
-        profile_stats = {'total_flops': 0, 'tensorcore_util': 0, 'profiler_available': False}
-        if rank == 0 and device.type == 'cuda':
-            print("Profiling for FLOPs (rank 0 only)...")
-            # Profile without ring attention to get per-GPU FLOPs baseline
-            # Then multiply by world_size for total system FLOPs
-            profile_stats = profile_flops_and_metrics(
-                model, input_ids_local, num_iters=3, use_ring_attention=True
-            )
-            # Scale FLOPs to represent total system work
-            # Each GPU processes full attention over all K,V chunks
-            profile_stats['total_flops'] = profile_stats['total_flops'] * world_size
-
-        dist.barrier()
-
-        # Reset memory stats after warmup/profiling
-        if device.type == 'cuda':
-            torch.cuda.reset_peak_memory_stats()
-
-        # Benchmark with comm/compute breakdown
-        if rank == 0:
-            print(f"Benchmarking ({num_iters} iterations)...")
-
-        latencies = []
-        compute_times = []
-        comm_times = []
-
-        dist.barrier()
-
-        with torch.no_grad():
-            for i in range(num_iters):
-                if device.type == 'cuda':
-                    torch.cuda.synchronize()
-
-                # Measure barrier (communication sync) time
-                comm_start = time.perf_counter()
-                dist.barrier()
-                if device.type == 'cuda':
-                    torch.cuda.synchronize()
-                comm_end = time.perf_counter()
-
-                # Measure total iteration time
-                start = time.perf_counter()
-                _ = model(input_ids_local, use_ring_attention=True)
-
-                if device.type == 'cuda':
-                    torch.cuda.synchronize()
-                dist.barrier()
-
-                end = time.perf_counter()
-
-                total_time = (end - start) * 1000  # ms
-                barrier_time = (comm_end - comm_start) * 1000  # ms
-
-                latencies.append(total_time)
-                comm_times.append(barrier_time)
-                compute_times.append(total_time - barrier_time)
-
-        # Compute stats (only on rank 0)
-        if rank == 0:
-            avg_latency = sum(latencies) / len(latencies)
-            min_latency = min(latencies)
-            max_latency = max(latencies)
-            throughput = (batch_size * seq_len_global) / (avg_latency / 1000)
-
-            avg_compute = sum(compute_times) / len(compute_times)
-            avg_comm = sum(comm_times) / len(comm_times)
-
-            # Comm/Compute ratio
-            comm_compute_ratio = avg_comm / avg_compute if avg_compute > 0 else 0
-
-            if device.type == 'cuda':
-                mem_allocated = torch.cuda.max_memory_allocated(device) / 1024**3
-                mem_reserved = torch.cuda.max_memory_reserved(device) / 1024**3
-            else:
-                mem_allocated = 0
-                mem_reserved = 0
-
-            # MFU using actual profiled FLOPs
-            mfu_stats = compute_mfu(profile_stats['total_flops'], avg_latency / 1000, dtype)
-
-            results = {
-                'avg_latency_ms': avg_latency,
-                'min_latency_ms': min_latency,
-                'max_latency_ms': max_latency,
-                'throughput_tokens_per_sec': throughput,
-                'mem_allocated_gb': mem_allocated,
-                'mem_reserved_gb': mem_reserved,
-                'world_size': world_size,
-                'num_params': num_params,
-                'avg_compute_ms': avg_compute,
-                'avg_comm_ms': avg_comm,
-                'comm_compute_ratio': comm_compute_ratio,
-                'tensorcore_util': profile_stats.get('tensorcore_util', 0),
-                **mfu_stats,
-            }
-
-            print(f"\nResults:")
-            print(f"  Avg latency: {avg_latency:.2f} ms")
-            print(f"  Min latency: {min_latency:.2f} ms")
-            print(f"  Max latency: {max_latency:.2f} ms")
-            print(f"  Throughput: {throughput:,.0f} tokens/sec")
-            if profile_stats['profiler_available']:
-                print(f"  Profiled FLOPs (system): {profile_stats['total_flops']:.2e}")
-                print(f"  MFU (system): {mfu_stats['mfu']:.1%}")
-                print(f"  Achieved TFLOPS (system): {mfu_stats['achieved_tflops']:.2f}")
-                print(f"  TensorCore utilization: {profile_stats['tensorcore_util']:.1%}")
-            else:
-                print(f"  MFU: N/A (profiler not available)")
-            print(f"  Avg compute time: {avg_compute:.2f} ms")
-            print(f"  Avg comm overhead: {avg_comm:.2f} ms")
-            print(f"  Comm/Compute ratio: {comm_compute_ratio:.2%}")
-            if device.type == 'cuda':
-                print(f"  Peak memory allocated (per GPU): {mem_allocated:.2f} GB")
-                print(f"  Peak memory reserved (per GPU): {mem_reserved:.2f} GB")
-
-            results_queue.put(results)
-
-    finally:
-        dist.destroy_process_group()
+              results = {                                                                                            
+                  'avg_latency_ms': avg_latency,                                                                     
+                  'min_latency_ms': min_latency,                                                                     
+                  'max_latency_ms': max_latency,                                                                     
+                  'throughput_tokens_per_sec': throughput,                                                           
+                  'mem_allocated_gb': mem_allocated,                                                                 
+                  'mem_reserved_gb': mem_reserved,                                                                   
+                  'world_size': world_size,                                                                          
+                  'num_params': num_params,                                                                          
+                  'avg_compute_ms': avg_compute,                                                                     
+                  'avg_comm_ms': avg_comm,                                                                           
+                  'comm_compute_ratio': comm_compute_ratio,                                                          
+                  'tensorcore_util': profile_stats.get('tensorcore_util', 0),                                        
+                  **mfu_stats,                                                                                       
+              }
+                                                                                                                     
+              print(f"\nResults:")                                                                                   
+              print(f"  Avg latency: {avg_latency:.2f} ms")                                                          
+              print(f"  Min latency: {min_latency:.2f} ms")                                                          
+              print(f"  Max latency: {max_latency:.2f} ms")                                                          
+              print(f"  Throughput: {throughput:,.0f} tokens/sec")                                                   
+              if profile_stats['profiler_available']:                                                                
+                  print(f"  Profiled FLOPs (system): {profile_stats['total_flops']:.2e}")                            
+                  print(f"  MFU (system): {mfu_stats['mfu']:.1%}")                                                   
+                  print(f"  Achieved TFLOPS (system): {mfu_stats['achieved_tflops']:.2f}")                           
+                  print(f"  TensorCore utilization: {profile_stats['tensorcore_util']:.1%}")                         
+              else:                                                                                                  
+                  print(f"  MFU: N/A (profiler not available)")                                                      
+              print(f"  Avg compute time: {avg_compute:.2f} ms")                                                     
+              print(f"  Avg comm overhead: {avg_comm:.2f} ms")                                                       
+              print(f"  Comm/Compute ratio: {comm_compute_ratio:.2%}")                                               
+              if device.type == 'cuda':                                                                              
+                  print(f"  Peak memory allocated (per GPU): {mem_allocated:.2f} GB")                                
+                  print(f"  Peak memory reserved (per GPU): {mem_reserved:.2f} GB")                                  
+                                                                                                                     
+              results_queue.put(results)                                                                             
+                                                                                                                     
+      finally:                                                                                                       
+          dist.destroy_process_group()
 
 
 def benchmark_ring_attention(
     args: ModelArgs,
     batch_size: int,
     seq_len: int,
-    world_size: int = 4,
+    world_size: int = 2,
     num_warmup: int = 5,
     num_iters: int = 20,
     backend: str = 'gloo',
@@ -522,7 +560,7 @@ def benchmark_ring_attention(
 
 def run_comparison(
     seq_lengths: list = None,
-    world_size: int = 4,
+    world_size: int = 2,
     batch_size: int = 1,
     num_warmup: int = 5,
     num_iters: int = 20,
@@ -636,9 +674,9 @@ def main():
     parser = argparse.ArgumentParser(description='Benchmark Ring Attention')
     parser.add_argument('--mode', choices=['vanilla', 'ring', 'compare'], default='compare',
                        help='Benchmark mode')
-    parser.add_argument('--seq-len', type=int, default=1024, help='Sequence length')
+    parser.add_argument('--seq-len', type=int, default=2048, help='Sequence length')
     parser.add_argument('--batch-size', type=int, default=1, help='Batch size')
-    parser.add_argument('--world-size', type=int, default=4, help='World size for ring attention')
+    parser.add_argument('--world-size', type=int, default=2, help='World size for ring attention')
     parser.add_argument('--num-warmup', type=int, default=5, help='Warmup iterations')
     parser.add_argument('--num-iters', type=int, default=20, help='Benchmark iterations')
     parser.add_argument('--dim', type=int, default=512, help='Model dimension')
@@ -676,7 +714,7 @@ def main():
 
     elif args.mode == 'compare':
         run_comparison(
-            seq_lengths=[512, 1024, 2048],
+            seq_lengths=[512, 1024, 2048, 4096, 8192, 16384, 32768],
             world_size=args.world_size,
             batch_size=args.batch_size,
             num_warmup=args.num_warmup,

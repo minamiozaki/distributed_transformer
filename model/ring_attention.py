@@ -101,6 +101,7 @@ def ring_attention_forward(
     """
     rank = dist.get_rank(process_group)
     world_size = dist.get_world_size(process_group)
+    print(f"Ring attention forward on rank {rank} with world size {world_size}")
 
     B, n_heads, S_local, head_dim = Q.shape
     scale = 1.0 / math.sqrt(head_dim)
@@ -123,30 +124,31 @@ def ring_attention_forward(
     O_i = torch.zeros_like(Q)
 
     # Working buffers for K, V rotation
-    K_j = K.clone()
-    V_j = V.clone()
-    K_buf = torch.empty_like(K)
-    V_buf = torch.empty_like(V)
-
+    K_j = K.clone().contiguous()
+    V_j = V.clone().contiguous()        
+    K_buf = torch.empty_like(K).contiguous()
+    V_buf = torch.empty_like(V).contiguous()
+    print(f"Ring attention forward on rank {rank} with world size {world_size} initialized buffers")
     for step in range(world_size):
         # Determine which chunk we're processing
         # source_rank tells us which device's original K,V we have
         source_rank = (rank - step) % world_size
 
         # Start async communication (except last step)
-        if step < world_size - 1:
-            next_rank = (rank + 1) % world_size
-            prev_rank = (rank - 1) % world_size
-
-            send_ops = [
-                dist.isend(K_j.contiguous(), next_rank, group=process_group),
-                dist.isend(V_j.contiguous(), next_rank, group=process_group),
+        reqs = None                                                                
+        if step < world_size - 1:                                                  
+            next_rank = (rank + 1) % world_size                                    
+            prev_rank = (rank - 1) % world_size                                    
+                                                                                     
+            ops = [                                                                
+                dist.P2POp(dist.isend, K_j, next_rank, group=process_group),       
+                dist.P2POp(dist.isend, V_j, next_rank, group=process_group),       
+                dist.P2POp(dist.irecv, K_buf, prev_rank, group=process_group),     
+                dist.P2POp(dist.irecv, V_buf, prev_rank, group=process_group),     
             ]
-            recv_ops = [
-                dist.irecv(K_buf, prev_rank, group=process_group),
-                dist.irecv(V_buf, prev_rank, group=process_group),
-            ]
-
+                                                                                  
+            reqs = dist.batch_isend_irecv(ops)
+            print(f"Ring attention forward on rank {rank} with world size {world_size} sent and received data")
         # Expand K, V for GQA
         K_expanded = repeat_kv(K_j, n_rep)  # [B, n_heads, S_local, head_dim]
         V_expanded = repeat_kv(V_j, n_rep)
@@ -207,13 +209,15 @@ def ring_attention_forward(
         m_i = m_new
         l_i = l_new
 
-        # Wait for communication to complete
-        if step < world_size - 1:
-            for op in send_ops + recv_ops:
-                op.wait()
-            # Swap buffers for next iteration
-            K_j, K_buf = K_buf, K_j
+        # Wait for communication to complete   
+        print(f"Ring attention forward on rank {rank} with world size {world_size} waiting for communication to complete")
+        if reqs is not None:                                                       
+            for req in reqs:                                                       
+                req.wait()                                                         
+            # Swap buffers for next iteration                                      
+            K_j, K_buf = K_buf, K_j                                                
             V_j, V_buf = V_buf, V_j
+        print(f"Ring attention forward on rank {rank} with world size {world_size} communication completed")
 
     return O_i
 

@@ -281,6 +281,28 @@ NCCL uses NVLink/PCIe for direct GPU-to-GPU communication. Gloo routes through C
 
 **Key insight**: Ring attention's value isn't speed—it's enabling sequence lengths that would otherwise be impossible due to memory constraints.
 
+** 1/19 Update on Basic Performance on 2 x H100 GPU server **
+==============================================================================================================
+SUMMARY
+==============================================================================================================
+ Seq Len |    Vanilla |       Ring |  Speedup |  V-MFU |  R-MFU |  V-Mem |  R-Mem |   TC% |  Comm%
+         |       (ms) |       (ms) |          |        |        |   (GB) |   (GB) |       |       
+--------------------------------------------------------------------------------------------------------------
+     512 |       2.73 |       8.44 |    0.32x | 15.5% |  5.4% |   0.34 |   0.28 |  53% |  1.2%
+    1024 |       3.20 |       8.57 |    0.37x | 26.4% | 11.4% |   0.46 |   0.34 |  42% |  1.1%
+    2048 |       4.63 |       8.89 |    0.52x | 36.5% | 24.8% |   0.71 |   0.49 |  28% |  1.1%
+    4096 |       9.29 |      14.03 |    0.66x | 36.4% | 38.8% |   1.21 |   1.02 |  51% |  0.7%
+    8192 |      21.19 |      41.37 |    0.51x | 31.9% | 36.3% |   2.21 |   2.90 |  12% |  0.2%
+   16384 |      57.83 |     145.17 |    0.40x | 23.4% | 32.0% |   4.21 |   9.83 |   6% |  0.1%
+   32768 |     180.35 |     554.35 |    0.33x | 15.0% | 28.7% |   8.21 |  36.45 |   3% |  0.1%
+==============================================================================================================
+Legend:
+  Speedup > 1 means ring is faster
+  MFU = Model FLOPs Utilization (higher is better, uses profiled FLOPs)
+  V-Mem = Vanilla peak memory, R-Mem = Ring peak memory per GPU
+  TC% = TensorCore utilization (matmul time / total CUDA time)
+  Comm% = Communication/Compute ratio for ring attention (lower is better)
+
 ## Limitations & Future Work
 
 **Current limitations:**

@@ -303,15 +303,15 @@ NCCL uses NVLink/PCIe for direct GPU-to-GPU communication. Gloo routes through C
 
 ## Limitations & Future Work
 
-**Current limitations:**
+**Current Implementation(1/20):**
 - Forward pass only (no backward pass / training)
 - No FlashAttention integration (would further improve memory)
-- Causal mask doesn't skip future chunks (potential optimization)
+- Skip attention computation for fully-masked future chunks
+- Ring Attention calls Flash Attention for each chunk computation to match vanilla implementation
+
 
 **Potential optimizations:**
-- Skip attention computation for fully-masked future chunks
 - Fuse K,V communication with attention computation
-- Integrate with FlashAttention-2 for block-sparse attention
 
 ## References
 

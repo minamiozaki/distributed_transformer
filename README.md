@@ -300,6 +300,7 @@ NCCL uses NVLink/PCIe for direct GPU-to-GPU communication. Gloo routes through C
 - V-Mem = Vanilla peak memory, R-Mem = Ring peak memory per GPU
 - TC% = TensorCore utilization (matmul time / total CUDA time)
 - Comm% = Communication/Compute ratio for ring attention (lower is better)
+- **Both speedup and memory consumption of Ring Attention is way worse than vanilla, this is due to vanilla forward already uses torch.nn.f.scaled_dot_product_attention() which underlying calls FlashAttention. So we need to make sure Ring Attention is also calling FlashAttention internal calls that returns LSE and output score for each rank, then rescale the result and LSE after each rotation. This way we shall see memory improvement and perf speedup.**
 
 ## 1/22 Performance Benchmark on 2 x H100 80GB GPU server
 

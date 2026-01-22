@@ -301,16 +301,41 @@ NCCL uses NVLink/PCIe for direct GPU-to-GPU communication. Gloo routes through C
 - TC% = TensorCore utilization (matmul time / total CUDA time)
 - Comm% = Communication/Compute ratio for ring attention (lower is better)
 
+## 1/22 Performance Benchmark on 2 x H100 80GB GPU server
+
+With Flash Attention integration and bf16 precision, tested up to 1M context length:
+
+| Seq Len | Vanilla (ms) | Ring (ms) | **Speedup** | V-Mem (GB) | R-Mem/GPU (GB) | Comm% |
+|---------|-------------|-----------|-------------|------------|----------------|-------|
+| 512 | 1.93 | 3.55 | 0.54x | 0.19 | 0.16 | 2.2% |
+| 1K | 1.99 | 4.25 | 0.47x | 0.26 | 0.19 | 2.2% |
+| 2K | 1.96 | 3.68 | 0.53x | 0.38 | 0.26 | 2.4% |
+| 4K | 2.06 | 3.57 | 0.58x | 0.63 | 0.38 | 2.4% |
+| 8K | 3.27 | 3.78 | 0.87x | 1.13 | 0.63 | 2.2% |
+| 16K | 7.68 | 5.76 | **1.33x** | 2.13 | 1.13 | 1.5% |
+| 32K | 21.87 | 15.43 | **1.42x** | 4.13 | 2.13 | 0.6% |
+| 64K | 70.24 | 51.20 | **1.37x** | 8.15 | 4.15 | 0.17% |
+| 128K | 253.81 | 187.02 | **1.36x** | 16.18 | 8.18 | 0.05% |
+| 256K | 1,022.23 | 710.52 | **1.44x** | 32.24 | 16.24 | 0.03% |
+| 512K | 4,107.53 | 2,795.55 | **1.47x** | 64.37 | 32.37 | 0.01% |
+| **1M** | **OOM** 💥 | 11,159.09 | **∞** | >80 | 64.62 | 0.00% |
+
+**Key Results:**
+- **Crossover at ~16K**: Ring attention becomes faster than vanilla
+- **1.47x speedup at 512K** with half the memory per GPU
+- **1M tokens**: Vanilla OOMs, Ring handles it with 64.6 GB/GPU
+- **Communication overhead vanishes**: Down to 0.00% at 1M tokens
+
 ## Limitations & Future Work
 
-**Current Implementation(1/20):**
+**Current Implementation (1/22):**
 - Forward pass only (no backward pass / training)
-- No FlashAttention integration (would further improve memory)
-- Skip attention computation for fully-masked future chunks
-- Ring Attention calls Flash Attention for each chunk computation to match vanilla implementation
-
+- ✅ Flash Attention integration with proper bf16 dtype handling
+- ✅ Skip attention computation for fully-masked future chunks
+- ✅ Ring Attention calls Flash Attention for each chunk computation
 
 **Potential optimizations:**
+- Backward pass for training
 - Fuse K,V communication with attention computation
 
 ## References

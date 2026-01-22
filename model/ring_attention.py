@@ -112,6 +112,7 @@ def ring_attention_forward_flash(
     """
     rank = dist.get_rank(process_group)
     world_size = dist.get_world_size(process_group)
+    print(f"[Flash] Rank {rank}: Starting ring attention forward, world_size={world_size}")
 
     B, n_heads, S_local, head_dim = Q.shape
     n_kv_heads = K.shape[1]
@@ -131,7 +132,10 @@ def ring_attention_forward_flash(
     O_acc = None
     lse_acc = None  # [B, n_heads, S_local]
 
+    print(f"[Flash] Rank {rank}: Buffers initialized")
+
     for step in range(world_size):
+        print(f"[Flash] Rank {rank}: Step {step}/{world_size}")
         # Determine which chunk we're processing
         source_rank = (rank - step) % world_size
 
@@ -147,7 +151,9 @@ def ring_attention_forward_flash(
                 dist.P2POp(dist.irecv, K_buf, prev_rank, group=process_group),
                 dist.P2POp(dist.irecv, V_buf, prev_rank, group=process_group),
             ]
+            print(f"[Flash] Rank {rank}: Step {step} - Starting batch_isend_irecv")
             reqs = dist.batch_isend_irecv(ops)
+            print(f"[Flash] Rank {rank}: Step {step} - batch_isend_irecv started")
 
         # Determine causal mode for this chunk pair
         if is_causal and source_rank > rank:
@@ -161,16 +167,21 @@ def ring_attention_forward_flash(
 
             # Use _flash_attn_forward to get softmax_lse without materializing
             # the N^2 attention matrix. return_softmax=False is key here.
-            out_j, _, _, _, _, lse_j, _, _ = _flash_attn_forward(
+            # API returns (out, softmax_lse, S_dmask, rng_state)
+            softmax_scale = 1.0 / math.sqrt(head_dim)
+            print(f"[Flash] Rank {rank}: Step {step} - Calling _flash_attn_forward")
+            out_j, lse_j, _, _ = _flash_attn_forward(
                 Q_flash, K_j, V_j,
-                dropout_p=0.0,
-                softmax_scale=None,  # defaults to 1/sqrt(head_dim)
-                causal=use_causal,
-                window_size=(-1, -1),  # no sliding window
-                softcap=0.0,
-                alibi_slopes=None,
-                return_softmax=False,  # critical: don't materialize N^2 matrix
+                0.0,  # dropout_p
+                softmax_scale,
+                use_causal,  # causal
+                -1,  # window_size_left (-1 = no sliding window)
+                -1,  # window_size_right
+                0.0,  # softcap
+                None,  # alibi_slopes
+                False,  # return_softmax - critical: don't materialize N^2 matrix
             )
+            print(f"[Flash] Rank {rank}: Step {step} - _flash_attn_forward returned")
             # out_j: [B, S_local, n_heads, head_dim]
             # lse_j: [B, n_heads, S_local]
 
@@ -192,9 +203,11 @@ def ring_attention_forward_flash(
 
                 # Weighted combination of outputs
                 # Reshape for broadcasting: [B, n_heads, S_local] -> [B, S_local, n_heads, 1]
-                exp_acc_b = exp_acc.transpose(1, 2).unsqueeze(-1)
-                exp_j_b = exp_j.transpose(1, 2).unsqueeze(-1)
-                exp_sum_b = exp_sum.transpose(1, 2).unsqueeze(-1)
+                # Cast to output dtype to avoid upcasting to float32 (LSE is always float32)
+                out_dtype = out_j.dtype
+                exp_acc_b = exp_acc.transpose(1, 2).unsqueeze(-1).to(out_dtype)
+                exp_j_b = exp_j.transpose(1, 2).unsqueeze(-1).to(out_dtype)
+                exp_sum_b = exp_sum.transpose(1, 2).unsqueeze(-1).to(out_dtype)
 
                 O_acc = (exp_acc_b * O_acc + exp_j_b * out_j) / exp_sum_b
 
@@ -202,11 +215,13 @@ def ring_attention_forward_flash(
                 lse_acc = lse_max + torch.log(exp_sum)
 
         # Wait for communication to complete
+        print(f"[Flash] Rank {rank}: Step {step} - Waiting for communication")
         if reqs is not None:
             for req in reqs:
                 req.wait()
             K_j, K_buf = K_buf, K_j
             V_j, V_buf = V_buf, V_j
+        print(f"[Flash] Rank {rank}: Step {step} - Communication done")
 
     # Handle edge case where all chunks were masked (shouldn't happen in practice)
     if O_acc is None:
